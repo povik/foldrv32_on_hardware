@@ -1,0 +1,231 @@
+# opcode constants
+const LUI    = 0x0d << 2 | 3;
+const AUIPC  = 0x05 << 2 | 3;
+const JAL    = 0x1b << 2 | 3;
+const JALR   = 0x19 << 2 | 3;
+const BRANCH = 0x18 << 2 | 3;
+const LOAD   = 0x00 << 2 | 3;
+const STORE  = 0x08 << 2 | 3;
+const OP_IMM = 0x04 << 2 | 3;
+const OP     = 0x0c << 2 | 3;
+const MEM_MISC = 0x03 << 2 | 3;
+const SYSTEM   = 0x1c << 2 | 3;
+
+# funct3 constants
+const BEQ  = 0;
+const BNE  = 1;
+const BLT  = 4;
+const BGE  = 5;
+const BLTU = 6;
+const BGEU = 7;
+const LB  = 0;
+const LH  = 1;
+const LW  = 2;
+const LBU = 4;
+const LHU = 5;
+const SB = 0;
+const SH = 1;
+const SW = 2;
+
+func core(boot_pc [32]) () {
+	var wm [4096, 4, 8] mut; ` mem.
+	` meminit.
+	wm = read_tsv!('fw/image.tsv');
+
+	func memio(addr [32], wdata [32], be [4], we [1]) (rdata [32])
+	{
+		if (we) {
+			if be[0] { wm[addr >> 2, 0] = wdata[7..0]; }
+			if be[1] { wm[addr >> 2, 1] = wdata[15..8]; }
+			if be[2] { wm[addr >> 2, 2] = wdata[23..16]; }
+			if be[3] { wm[addr >> 2, 3] = wdata[31..24]; }
+		} else {
+			rdata = (wm[addr >> 2, 0] | wm[addr >> 2, 1] << 8 |
+						 wm[addr >> 2, 2] << 16 | wm[addr >> 2, 3] << 24);
+		}
+	}
+
+	var regs [16, 32] mut; ` mem.
+	regs[0] = 0;
+	var start_pc [32] mut;
+	start_pc = boot_pc;
+	restart:
+	{
+		var pc [32] mut;
+		pc = start_pc;
+		var extra_delay1 [1] mut;
+		extra_delay1 = 0;
+
+		var flush1 [1] mut, flush2 [1] mut;
+		flush1 = 0;
+		flush2 = 0;
+
+		for 1 {
+			var flush [1] mut;
+			flush = 0;
+
+			var i [32], opcode [7], pc_sample [32];
+			i = memio(pc, undef, undef, 0);
+			delay(1);
+			pc_sample = pc;
+			pc = pc + 4;
+
+			var opcode [7];
+			opcode = i[6..0];
+
+			var funct3 [3], funct7 [4], rs1 [5], rs2 [5], rd [5];
+			funct7 = i[31..25]; rs2 = i[24..20]; rs1 = i[19..15]; funct3 = i[14..12]; rd = i[11..7];
+
+			var imm_i [12] signed, imm_s [12] signed, imm_b [13] signed, imm_u [32] signed, imm_j [21] signed;
+			imm_i = i[31..20];
+			imm_s = i[31..25] << 5 | i[11..7];
+			imm_b = i[31] << 12 | i[7] << 11 | i[30..25] << 5 | i[11..8] << 1;
+			imm_u = i[31..12] << 12;
+			imm_j = i[31] << 20 | i[19..12] << 12 | i[20] << 11 | i[30..21] << 1;
+
+			if extra_delay1 {
+				delay(1);
+				if flush1 || flush2 {
+					quit;
+				}
+			}
+			extra_delay1 = 0;
+
+			var r1 [32], r2 [32], r1s [32] signed, r2s [32] signed;
+			` transp.
+			r1 = regs[rs1];
+			` transp.
+			r2 = (opcode != OP_IMM) ? regs[rs2] : imm_i;
+			r1s = r1; r2s = r2;
+
+			#print("(%d,%d) [%08x] %08x (r1 %08x r2 %08x)\n", flush1, flush2, pc_sample, i, r1, r2);
+
+			if flush2 {
+				quit;
+			}
+
+			delay(1);
+			func wb(r [32]) () {
+				if rd != 0 && !flush1 { regs[rd] = r; }
+			}
+
+			if opcode == LOAD {
+				var addr [32], mem_r [32], r [32];
+				addr = r1 + imm_i;
+
+				if !addr[31] {
+					if !flush1 {
+						mem_r = memio(addr & ~3, undef, undef, 0) >> 8 * addr[1..0];
+					}
+					if funct3 == LW  { r = mem_r; }
+					if funct3 == LH  { var h [16] signed; h = mem_r; r = h; }
+					if funct3 == LHU { var h [16]; h = mem_r; r = h; }
+					if funct3 == LB  { var h [8] signed; h = mem_r; r = h; }
+					if funct3 == LBU { var h [8]; h = mem_r; r = h; }
+					delay(1);
+					wb(r);
+					delay(-1);
+				} else {
+					if !flush1 {
+						# This is a MMIO read, but we found out too late, the core has went on
+						# processing as if this was an ordinary working memory read!
+						#
+						# We need to cancel the thread (through `flush`), and fork into a new
+						# thread where we wait on the MMIO read to finish.
+						` mcode_fork ignore_jump.
+						fork skip;
+						delay(2);
+						` wait.
+						_, r = mmio_read(addr & ~3);
+						delay(2);
+						wb(r);
+						start_pc = pc;
+						goto restart;
+					skip:
+						flush = 1;
+					}
+				}
+				extra_delay1 = 1;
+			} else if opcode == STORE {
+				var addr [32], mask [4];
+				addr = r1 + imm_s;
+
+				if !flush1 {
+					if !addr[31] {
+						if funct3 == SB { mask = 1; }
+						if funct3 == SH { mask = 3; }
+						if funct3 == SW { mask = 15; }
+						_ = memio(addr & ~3, r2 << (8 * addr[1..0]), mask << addr[1..0], 1);
+					} else {
+						# This is a MMIO write, and the handling is similar
+						# to a MMIO read
+						` mcode_fork ignore_jump.
+						fork skip;
+						delay(2);
+						` wait.
+						_ = mmio_write(addr & ~3, r2);
+						delay(2);
+						start_pc = pc;
+						goto restart;
+					skip:
+						flush = 1;
+					}
+				}
+				extra_delay1 = 1;
+			} else if opcode == JAL {
+				pc = imm_j + pc_sample;
+				wb(pc_sample + 4);
+				delay(2);
+				if flush1 {
+					quit;
+				}
+			} else if opcode == JALR {
+				pc = (r1 + imm_i) & -2;
+				wb(pc_sample + 4);
+				delay(2);
+				if flush1 {
+					quit;
+				}
+			} else if opcode == OP || opcode == OP_IMM {
+				var r [32];
+				if !(opcode & 0x20) || !(funct7 & ~0x20) {
+					if funct3 == 0 { r = (opcode & 0x20) && i[30] ? r1 - r2 : r1 + r2; } # addi/add/sub
+					if funct3 == 2 { r = r1s < r2s; } # slti/slt
+					if funct3 == 3 { r = r1 < r2; } # sltiu/sltu
+					if funct3 == 4 { r = r1 ^ r2; } # xori/xor
+					if funct3 == 6 { r = r1 | r2; } # ori/or
+					if funct3 == 7 { r = r1 & r2; } # andi/and
+				}
+				var shamt [5];
+				shamt = r2;
+				if funct3 == 1  { r = r1 << shamt; } # slli/sll
+				if funct3 == 5 && !i[30] { r = r1 >> shamt; } # srli/srl
+				if funct3 == 5 && i[30]  { r = r1s >> shamt; } # srai/sra
+				wb(r);
+			} else if opcode == LUI {
+				wb(imm_u);
+			} else if opcode == AUIPC {
+				wb(imm_u + pc_sample);
+			} else if opcode == BRANCH {
+				var cond [1];
+				if funct3 == BEQ  { cond = r1 == r2; }
+				if funct3 == BNE  { cond = r1 != r2; }
+				if funct3 == BLT  { cond = r1s < r2s; }
+				if funct3 == BLTU { cond = r1 < r2; }
+				if funct3 == BGE  { cond = r1s >= r2s; }
+				if funct3 == BGEU { cond = r1 >= r2; }
+				if cond && !flush1 {
+					` mcode_fork ignore_jump.
+					fork skip;
+					delay(1);
+					start_pc = pc_sample + imm_b;
+					goto restart;
+				skip:
+					flush = 1;
+				}
+			}
+			flush2 = flush1; flush1 = flush;
+			delay(-1);
+		}
+	}
+}

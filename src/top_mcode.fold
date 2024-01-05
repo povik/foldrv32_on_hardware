@@ -1,0 +1,28 @@
+const periodbits = 16;
+
+func mmio_read(addr [32]) (ok [1], ret [32]) {
+	var addr_dispatch [16];
+	addr_dispatch = addr[15..0];
+
+	if addr_dispatch == 0x04 {
+		ok = 1;
+	} else {
+		ok = 0;
+	}
+}
+
+func mmio_write(addr [32], val [32]) (ok [1]) {
+	var addr_dispatch [16];
+	addr_dispatch = addr[15..0];
+
+	if addr_dispatch == 0x00 {
+		print("%c", val[7..0]);
+		ok = 1;
+	} else if addr_dispatch == 0x08 {
+		ok = 1;
+	} else {
+		ok = 0;
+	}
+}
+
+core(0);

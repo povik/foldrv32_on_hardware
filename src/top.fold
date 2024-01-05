@@ -1,0 +1,94 @@
+const periodbits = 16;
+
+` io.
+func uart_tx_pin(level [1]) () {}
+
+chan uart_tx (data [8]) ()
+chan uart_set_baudperiod (data [16]) ()
+chan uart_get_baudperiod () (data [16])
+
+func baud(level [1])() {
+	# Helper since we need a function with a single
+	# return value in the loop conditional below
+	func baudperiod() [periodbits] {
+		_, ret = uart_get_baudperiod->$nonblocking(1);
+	}
+
+	var j [periodbits] mut;
+	delay(1);
+	j = 1;
+	for j < baudperiod() {
+		uart_tx_pin(level);
+		j = j + 1;
+		delay(1);
+	}
+}
+
+func uart_periph() () {
+	fork baudreg;
+
+	for 1 {
+		var sym [8];
+
+		` wait.
+		sym = uart_tx<-();
+		print("%c", sym);
+
+		var sh [11] mut, p [4] mut;
+		sh = 0b11000000000 | (sym << 1);
+		p = 0;
+		for p < 11 {
+			` wait.
+			baud(sh[0]);
+			sh = sh >> 1;
+			p = p + 1;
+		}
+	}
+
+baudreg:
+	var r_baudperiod [periodbits] mut;
+	for 1 {
+		var ok [1], val [periodbits];
+		_ = uart_get_baudperiod<-$nonblocking(1, r_baudperiod);
+		ok, val = uart_set_baudperiod<-$nonblocking(1);
+		if ok {
+			r_baudperiod = val;
+		}
+		delay(1);
+	}
+}
+
+func mmio_read(addr [32]) (ok [1], ret [32]) {
+	var addr_dispatch [16];
+	addr_dispatch = addr[15..0];
+
+	if addr_dispatch == 0x04 {
+		var ready [1];
+		ready = uart_tx->$nonblocking(0, undef);
+		ret = !ready;
+		ok = 1;
+	} else {
+		ok = 0;
+	}
+}
+
+func mmio_write(addr [32], val [32]) (ok [1]) {
+	var addr_dispatch [16];
+	addr_dispatch = addr[15..0];
+
+	if addr_dispatch == 0x00 {
+		ok = uart_tx->$nonblocking(1, val[7..0]);
+	} else if addr_dispatch == 0x08 {
+		ok = uart_set_baudperiod->$nonblocking(1, val);
+	} else {
+		ok = 0;
+	}
+}
+
+# let's spawn both core() and uart_periph()
+# core() will call into mmio_read and mmio_write to handle reads and writes
+fork periph_thread;
+core(0);
+quit;
+periph_thread:
+uart_periph();
